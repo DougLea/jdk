@@ -1958,6 +1958,7 @@ public class ForkJoinPool extends AbstractExecutorService
         }
     }
 
+
     /**
      * Top-level runloop for workers, called by ForkJoinWorkerThread.run.
      * See above for explanation.
@@ -2011,18 +2012,15 @@ public class ForkJoinPool extends AbstractExecutorService
                                 }
                             }
                             else if (idle == 0) {     // taken
-                                int signal;
                                 q.base = nb;
                                 U.storeFence();       // ensure timely write
-                                if ((signal = qid - src) != 0)
+                                if (qid != src)
                                     w.source = src = qid;
-                                else if ((qid & 1) == 0) {
-                                    signal = b - propagated;
+                                if (b != propagated &&
+                                    U.getReferenceAcquire(a, np) != null) {
                                     propagated = nb;  // no signal if taken next
-                                }
-                                if (signal != 0 &&
-                                    U.getReferenceAcquire(a, np) != null)
                                     signalWork();
+                                }
                                 w.topLevelExec(t, fifo);
                                 w.nsteals = ++nsteals;
                                 rescan = true;
@@ -2053,6 +2051,10 @@ public class ForkJoinPool extends AbstractExecutorService
                             }
                         }
                     }
+                    if ((polls & (n - 1)) == 0 && (runState != e || queues != qs)) {
+                        rescan = true;                // stale
+                        break;
+                    }
                 }
                 i = r;                                // origin unless reactivated
                 if (!rescan && runState == e) {
@@ -2068,7 +2070,7 @@ public class ForkJoinPool extends AbstractExecutorService
                             idle = IDLE;
                             if (src >= 0) {
                                 asrc = src;           // record last active qid
-                                src = -1;             // re-enable propagation
+                                src = -1;
                             }
                         }
                     }
@@ -2099,30 +2101,27 @@ public class ForkJoinPool extends AbstractExecutorService
                 (Thread.currentThread() instanceof ForkJoinWorkerThread f))
                 f.resetThreadLocals();        // (instanceof check always true)
             while ((phase = w.phase) != activePhase) {
-                long d = 0, e, c;
-                Thread.interrupted();         // clear status
-                if (((e = runState) & STOP) != 0L)
-                    break;
                 boolean trimmable = false;    // true if at ctl head and quiescent
-                int sp = (int)(c = ctl), ac;
-                if ((ac = ((short)(c >>> RC_SHIFT) & SMASK)) == 0) {
-                    if ((e & SHUTDOWN) != 0L && quiescent() > 0)
-                        break;                // quiescent termination
-                    if (sp == activePhase) {
-                        boolean trim = false;
-                        long now = System.currentTimeMillis();
-                        if (deadline == 0L) {
-                            d = deadline = now + keepAlive;
-                            if (src < 0 && w.source == INVALID_ID)
-                                trim = true;
-                        }
-                        else if ((d = deadline) - now <= TIMEOUT_SLOP)
+                long d = 0, c = ctl, e = runState;
+                int ac = ((short)(c >>> RC_SHIFT) & SMASK), sp = (int)c;
+                if ((e & STOP) != 0L ||
+                    ((e & SHUTDOWN) != 0L && ac == 0 &&  quiescent() > 0))
+                    break;                    // quiescent termination
+                if (ac == 0 && sp == activePhase) {
+                    boolean trim = false;
+                    long now = System.currentTimeMillis();
+                    if (deadline == 0L) {
+                        d = deadline = now + keepAlive;
+                        if (src < 0 && w.source == INVALID_ID)
                             trim = true;
-                        if (trim && tryTrim(w, c, activePhase))
-                            break;
-                        trimmable = true;
                     }
+                    else if ((d = deadline) - now <= TIMEOUT_SLOP)
+                        trim = true;
+                    if (trim && tryTrim(w, c, activePhase))
+                        break;
+                    trimmable = true;
                 }
+                Thread.interrupted();         // clear status
                 if (parking == 0) {           // enable unpark
                     int spins = (src >= 0 || sp != activePhase) ? 0 : ac + SPIN_WAITS;
                     while ((phase = w.phase) != activePhase && --spins > 0)
@@ -2235,8 +2234,14 @@ public class ForkJoinPool extends AbstractExecutorService
             long nc = ((c + TC_UNIT) & TC_MASK) | (c & ~TC_MASK);
             if ((runState & STOP) != 0L)                // terminating
                 stat = 0;
-            else if (compareAndSetCtl(c, nc))
-                stat = createWorker() ? UNCOMPENSATE : 0;
+            else if (compareAndSetCtl(c, nc)) {
+                if (createWorker())
+                    stat = UNCOMPENSATE;
+                else {                                  // back out
+                    getAndAddCtl(RC_UNIT);
+                    stat = 0;
+                }
+            }
         }
         else if (!compareAndSetCtl(c, c))               // validate
             ;
@@ -3511,7 +3516,10 @@ public class ForkJoinPool extends AbstractExecutorService
      * elapsed unless pool is stopping
      */
     final void executeEnabledScheduledTask(ScheduledForkJoinTask<?> task) {
-        externalSubmissionQueue(false).push(task, this, false);
+        if ((runState & STOP) != 0L)
+            task.trySetCancelled();
+        else
+            externalSubmissionQueue(false).push(task, this, false);
     }
 
     /**
