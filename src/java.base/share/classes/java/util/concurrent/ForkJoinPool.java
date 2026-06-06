@@ -1098,6 +1098,7 @@ public class ForkJoinPool extends AbstractExecutorService
     static final int UNCOMPENSATE     = 1 << 16;  // tryCompensate return
     static final int IDLE             = 1 << 16;  // phase seqlock/version count
     static final int MIN_QUEUES_SIZE  = 1 << 4;   // ensure external slots
+    static final int SCAN_WAIT        = -2;       // sentinal for scan
 
     /*
      * Bits and masks for ctl and bounds are packed with 4 16 bit subfields:
@@ -1443,7 +1444,6 @@ public class ForkJoinPool extends AbstractExecutorService
                 task.doExec();
                 task = nextLocalTask(fifo);
             }
-            ++nsteals;
         }
 
         /**
@@ -1968,15 +1968,16 @@ public class ForkJoinPool extends AbstractExecutorService
      * @param w caller's WorkQueue (may be null on failed initialization)
      */
     final void runWorker(WorkQueue w) {
-        if (w != null) {
-            int phase = w.phase, r = w.stackPred;     // seed from registerWorker
+        int phase, r;                                     // skip if unregistered
+        if (w != null && (phase = w.phase) != 0 && (r = w.stackPred) != 0) {
             for (int src = -1;;) {
                 r ^= r << 13; r ^= r >>> 17; r ^= r << 5; // xorshift
                 long stat = scan(w, r, phase, src);
+                src = (int)(stat >>> 32);
                 if ((phase = (int)(stat & LMASK)) == 0)
                     break;
-                if ((src = (int)(stat >>> 32)) == INVALID_ID) {
-                    if (((phase = awaitWork(w, phase)) & IDLE) != 0)
+                if (src == SCAN_WAIT) {
+                    if ((phase = awaitWork(w, phase)) == 0)
                         break;
                     src = -1;
                 }
@@ -1984,20 +1985,29 @@ public class ForkJoinPool extends AbstractExecutorService
         }
     }
 
+    /**
+     * Scans for and executes tasks.
+     * @param w the worker
+     * @param r random seed
+     * @param phase w's current known phase
+     * @param src queue index of last taken task, or -1 if none
+     * @return long packed with phase and src, with phase as 0 for exit,
+     * and src as SCAN_WAIT if empty and deactivated
+     */
     private long scan(WorkQueue w, int r, int phase, int src) {
         long e = runState;
         WorkQueue[] qs = queues;
-        int i = r, stride = (r >>> 16) | 1, idle = phase & IDLE, n;
+        int i = r, stride = (r >>> 16) | 1, idle = phase & IDLE, taken = 0, n;
         if ((e & STOP) != 0L || qs == null || w == null || (n = qs.length) <= 0)
-            phase = 0;
+            phase = src = 0;
         else {
-            int polls = (idle != 0 || src < 0) ? n : n << 3;
+            int polls = (idle != 0 || src < 0 || (e & SHUTDOWN) != 0L) ? n :
+                    n + (n | (SPIN_WAITS | (SPIN_WAITS << 2)));
             outer: for ( ; ; i += stride) {
                 WorkQueue q; int qid;
                 if ((q = qs[qid = i & (n - 1)]) != null) {
                     ForkJoinTask<?>[] a;
-                    boolean taken = false;
-                    for (int b = q.base, prevb = b - 1, cap;
+                    for (int b = q.base, prevb = b - 1, propagated = prevb, cap;
                          (a = q.array) != null && (cap = a.length) > 0;
                          prevb = b) {             // track stalls
                         int m = cap - 1, nb = b + 1;
@@ -2014,22 +2024,25 @@ public class ForkJoinPool extends AbstractExecutorService
                             if (U.getReferenceAcquire(a, bp) == null) {
                                 if (U.getReference(a, np) == null &&
                                     q.array == a && b == (b = q.base)) {
-                                    if (taken)   // end run
+                                    if (taken != 0) // end run
                                         break outer;
                                     break;
                                 }
-                                if (b == prevb || src != qid)  // stalled or busy
+                                if (b == prevb)   // stalled
                                     break outer;  // reorder scan
                             }
                         }
                         else if (idle == 0) {
                             q.base = nb;
-                            if (U.getReferenceAcquire(a, np) != null)
+                            if (U.getReferenceAcquire(a, np) != null &&
+                                b != propagated) {
+                                propagated = nb;  // don't resignal if taken next
                                 signalWork();     // propagate
-                            taken = true;
+                            }
                             if (src != qid)
                                 w.source = src = qid;
                             w.topLevelExec(t);
+                            ++taken;
                             b = q.base;
                         }
                         else if ((idle = (phase = w.phase) & IDLE) != 0) {
@@ -2057,23 +2070,31 @@ public class ForkJoinPool extends AbstractExecutorService
                     if (runState != e || queues != qs)
                         break;                    // stale
                     if (polls == 0) {
-                        if (idle == 0) {          // try to deactivate
+                        if (idle != 0)
+                            src = SCAN_WAIT;      // await signal
+                        else {                    // try to deactivate
                             int ip = phase | IDLE, ap = phase + (IDLE << 1);
                             long pc = ctl;
                             long qc = ((pc - RC_UNIT) & UMASK) | (ap & LMASK);
                             w.stackPred = (int)pc;
                             w.phase = ip;         // enqueue
-                            if (!U.compareAndSetLong(this, CTL, pc, qc))
-                                w.phase = phase;  // back out on contention
-                            else
+                            if (U.compareAndSetLong(this, CTL, pc, qc))
                                 phase = ip;
+                            else {
+                                w.phase = phase;  // back out on contention
+                                src = -1;
+                            }
                         }
-                        else if (phase == (phase = w.phase))
-                            src = INVALID_ID;     // block
                         break;
                     }
                 }
             }
+        }
+        if (taken != 0) {
+            w.nsteals += taken;
+            if ((w.config & CLEAR_TLS) != 0 &&
+                (Thread.currentThread() instanceof ForkJoinWorkerThread f))
+                f.resetThreadLocals();            // (instanceof check always true)
         }
         return (((long)src) << 32) | (phase & LMASK);
     }
@@ -2083,10 +2104,10 @@ public class ForkJoinPool extends AbstractExecutorService
      *
      * @param w the work queue
      * @param phase current phase
-     * @return current phase, with IDLE set if worker should exit
+     * @return current phase, or 0 if worker should exit
      */
     private int awaitWork(WorkQueue w, int phase) {
-        if (w != null && (phase & IDLE) != 0) {
+        if ((phase & IDLE) != 0 && (runState & STOP) == 0L && w != null) {
             long deadline = 0L;
             int parking = 0, activePhase = phase + IDLE;
             while ((phase = w.phase) != activePhase) {
@@ -2094,7 +2115,7 @@ public class ForkJoinPool extends AbstractExecutorService
                 long d = 0, c = ctl, e = runState;
                 int ac = ((short)(c >>> RC_SHIFT) & SMASK), sp = (int)c;
                 if ((e & STOP) != 0L ||
-                    ((e & SHUTDOWN) != 0L && ac == 0 &&  quiescent() > 0))
+                    ((e & SHUTDOWN) != 0L && ac == 0 && quiescent() > 0))
                     break;                    // quiescent termination
                 if (ac == 0 && sp == activePhase) {
                     boolean trim = false;
@@ -2114,9 +2135,6 @@ public class ForkJoinPool extends AbstractExecutorService
                 }
                 Thread.interrupted();         // clear status
                 if (parking == 0) {           // enable unpark
-                    if ((w.config & CLEAR_TLS) != 0 &&
-                        (Thread.currentThread() instanceof ForkJoinWorkerThread f))
-                        f.resetThreadLocals(); // (instanceof check always true)
                     if ((phase = w.phase) == activePhase)
                         break;
                     LockSupport.setCurrentBlocker(this);
@@ -2129,7 +2147,7 @@ public class ForkJoinPool extends AbstractExecutorService
             if (parking != 0)
                 LockSupport.setCurrentBlocker(null);
         }
-        return phase;
+        return (phase & IDLE) != 0 ? 0 : phase;
     }
 
     /**
