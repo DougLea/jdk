@@ -1098,7 +1098,7 @@ public class ForkJoinPool extends AbstractExecutorService
     static final int UNCOMPENSATE     = 1 << 16;  // tryCompensate return
     static final int IDLE             = 1 << 16;  // phase seqlock/version count
     static final int MIN_QUEUES_SIZE  = 1 << 4;   // ensure external slots
-    static final int SCAN_WAIT        = -2;       // sentinal for scan
+    static final int SCAN_WAIT        = 2;        // sentinal for scan
 
     /*
      * Bits and masks for ctl and bounds are packed with 4 16 bit subfields:
@@ -1968,17 +1968,14 @@ public class ForkJoinPool extends AbstractExecutorService
      * @param w caller's WorkQueue (may be null on failed initialization)
      */
     final void runWorker(WorkQueue w) {
-        int phase, r;                                     // skip if unregistered
-        if (w != null && (phase = w.phase) != 0 && (r = w.stackPred) != 0) {
-            for (int src = -1;;) {
+        if (w != null) {
+            int phase = w.phase, r = w.stackPred;     // seed from registerWorker
+            for (int src = -1; phase != 0;) {
                 r ^= r << 13; r ^= r >>> 17; r ^= r << 5; // xorshift
                 long stat = scan(w, r, phase, src);
                 src = (int)(stat >>> 32);
-                if ((phase = (int)(stat & LMASK)) == 0)
-                    break;
-                if (src == SCAN_WAIT) {
-                    if ((phase = awaitWork(w, phase)) == 0)
-                        break;
+                if ((phase = (int)(stat & LMASK)) == SCAN_WAIT) {
+                    phase = awaitWork(w, src);
                     src = -1;
                 }
             }
@@ -1997,7 +1994,8 @@ public class ForkJoinPool extends AbstractExecutorService
     private long scan(WorkQueue w, int r, int phase, int src) {
         long e = runState;
         WorkQueue[] qs = queues;
-        int i = r, stride = (r >>> 16) | 1, idle = phase & IDLE, taken = 0, n;
+        int i = r, stride = (r >>> 16) | 1;
+        int prevSrc = src, idle = phase & IDLE, taken = 0, n;
         if ((e & STOP) != 0L || qs == null || w == null || (n = qs.length) <= 0)
             phase = src = 0;
         else {
@@ -2034,10 +2032,11 @@ public class ForkJoinPool extends AbstractExecutorService
                         }
                         else if (idle == 0) {
                             q.base = nb;
-                            if (U.getReferenceAcquire(a, np) != null &&
+                            if (U.getReferenceVolatile(a, np) != null &&
                                 b != propagated) {
-                                propagated = nb;  // don't resignal if taken next
-                                signalWork();     // propagate
+                                if (prevSrc != qid)
+                                    propagated = nb; // avoid redundant signals
+                                signalWork();
                             }
                             if (src != qid)
                                 w.source = src = qid;
@@ -2071,7 +2070,7 @@ public class ForkJoinPool extends AbstractExecutorService
                         break;                    // stale
                     if (polls == 0) {
                         if (idle != 0)
-                            src = SCAN_WAIT;      // await signal
+                            phase = SCAN_WAIT;    // await signal
                         else {                    // try to deactivate
                             int ip = phase | IDLE, ap = phase + (IDLE << 1);
                             long pc = ctl;
@@ -2103,21 +2102,25 @@ public class ForkJoinPool extends AbstractExecutorService
      * Awaits signal or termination.
      *
      * @param w the work queue
-     * @param phase current phase
+     * @param src nonnegative if ran tasks since last activation
      * @return current phase, or 0 if worker should exit
      */
-    private int awaitWork(WorkQueue w, int phase) {
-        if ((phase & IDLE) != 0 && (runState & STOP) == 0L && w != null) {
+    private int awaitWork(WorkQueue w, int src) {
+        int phase = 0;
+        if ((runState & STOP) == 0L && w != null && ((phase = w.phase) & IDLE) != 0) {
             long deadline = 0L;
             int parking = 0, activePhase = phase + IDLE;
-            while ((phase = w.phase) != activePhase) {
+            for (;;) {
+                Thread.interrupted();         // clear status
                 boolean trimmable = false;    // true if at ctl head and quiescent
                 long d = 0, c = ctl, e = runState;
-                int ac = ((short)(c >>> RC_SHIFT) & SMASK), sp = (int)c;
+                int ac = ((short)(c >>> RC_SHIFT) & SMASK);
                 if ((e & STOP) != 0L ||
-                    ((e & SHUTDOWN) != 0L && ac == 0 && quiescent() > 0))
+                    ((e & SHUTDOWN) != 0L && ac == 0 && quiescent() > 0)) {
+                    phase = 0;
                     break;                    // quiescent termination
-                if (ac == 0 && sp == activePhase) {
+                }
+                if (ac == 0 && (int)c == activePhase) {
                     boolean trim = false;
                     long now = System.currentTimeMillis();
                     if (deadline == 0L) {
@@ -2129,25 +2132,32 @@ public class ForkJoinPool extends AbstractExecutorService
                     }
                     else if ((d = deadline) - now <= TIMEOUT_SLOP)
                         trim = true;
-                    if (trim && tryTrim(w, c, activePhase))
+                    if (trim && tryTrim(w, c, activePhase)) {
+                        phase = 0;
                         break;
+                    }
                     trimmable = true;
                 }
-                Thread.interrupted();         // clear status
-                if (parking == 0) {           // enable unpark
-                    if ((phase = w.phase) == activePhase)
+                if (parking == 0) {
+                    int spins = (src >= 0) ? 0 :
+                        (ac | (SPIN_WAITS | (SPIN_WAITS << 2)));
+                    while (((phase = w.phase) & IDLE) != 0 && --spins > 0)
+                        Thread.onSpinWait();  // reduce flailing on empty scans
+                    if ((phase & IDLE) == 0)
                         break;
                     LockSupport.setCurrentBlocker(this);
-                    parking = w.parking = activePhase;
+                    parking = w.parking = activePhase; // enable unpark
                 }
-                if ((phase = w.phase) == activePhase)
+                if (((phase = w.phase) & IDLE) == 0)
                     break;
                 U.park(trimmable, d);
+                if (((phase = w.phase) & IDLE) == 0)
+                    break;
             }
             if (parking != 0)
                 LockSupport.setCurrentBlocker(null);
         }
-        return (phase & IDLE) != 0 ? 0 : phase;
+        return phase;
     }
 
     /**
