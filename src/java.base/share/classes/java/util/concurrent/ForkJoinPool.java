@@ -1291,7 +1291,7 @@ public class ForkJoinPool extends AbstractExecutorService
                     unlockPhase();
                 if (room < 0)
                     throw new RejectedExecutionException("Queue capacity exceeded");
-                if ((room == 0 ||
+                if (((room == 0 | room == m) ||
                      U.getReferenceVolatile(a, slotOffset(m & (s - 1))) == null) &&
                     pool != null)
                     pool.signalWork();   // may have appeared empty
@@ -1442,8 +1442,7 @@ public class ForkJoinPool extends AbstractExecutorService
         /**
          * Runs the given task, as well as remaining local tasks.
          */
-        final void topLevelExec(ForkJoinTask<?> task) {
-            int fifo = config & FIFO;
+        final void topLevelExec(ForkJoinTask<?> task, int fifo) {
             while (task != null) {
                 task.doExec();
                 task = nextLocalTask(fifo);
@@ -1976,189 +1975,188 @@ public class ForkJoinPool extends AbstractExecutorService
     final void runWorker(WorkQueue w) {
         if (w != null) {
             int phase = w.phase, r = w.stackPred;     // seed from registerWorker
-            for (int src = -1; phase != 0;) {
+            int fifo = w.config & FIFO, nsteals = 0, src = -1;
+            for (;;) {
+                int n;
+                long e = runState;
+                WorkQueue[] qs = queues;
                 r ^= r << 13; r ^= r >>> 17; r ^= r << 5; // xorshift
-                long stat = scan(w, r, phase, src);
-                src = (int)(stat >>> 32);
-                if ((phase = (int)(stat & LMASK)) == SCAN_WAIT) {
-                    phase = awaitWork(w, src);
-                    src = -1;
+                if ((e & STOP) != 0L || qs == null || (n = qs.length) <= 0)
+                    break;
+                int i = r, step = (r >>> 16) | 1;
+                boolean rescan = false;
+                scan: for (int l = n; l > 0; --l, i += step) {  // scan queues
+                    int qid, cap; WorkQueue q; ForkJoinTask<?>[] a;
+                    if ((q = qs[qid = i & (n - 1)]) != null &&
+                        (a = q.array) != null && (cap = a.length) > 0) {
+                        int m = cap - 1, b = q.base, prevb = b - 1, propagated = prevb;
+                        for (; ; prevb = b) {         // track stalls
+                            int nb; long bp;
+                            ForkJoinTask<?> t = (ForkJoinTask<?>)
+                                U.getReferenceAcquire(a, bp = slotOffset(m & b));
+                            long np = slotOffset(m & (nb = b + 1));
+                            if (b != (b = q.base)) {  // inconsistent / busy
+                                if (src != qid) {
+                                    rescan = true;
+                                    break scan;      // reduce interference
+                                }
+                            }
+                            else if (t == null ||     // possibly empty
+                                     !U.compareAndSetReference(a, bp, t, null)) {
+                                if (U.getReferenceAcquire(a, bp) == null) {
+                                    if (U.getReference(a, np) == null &&
+                                        b == (b = q.base)) {
+                                        if (rescan)   // end run
+                                            break scan;
+                                        break;        // probably empty
+                                    }
+                                    if (b == prevb) {  // stalled
+                                        rescan = true;
+                                        break scan;  // reorder scan
+                                    }
+                                    if (b == propagated)
+                                        propagated = nb;
+                                }
+                            }
+                            else {
+                                boolean more = (U.getReferenceVolatile(a, np) != null);
+                                q.base = nb;
+                                w.nsteals = ++nsteals;
+                                int prevSrc = src;
+                                w.source = src = qid;    // volatile
+                                if (more &&
+                                    (prevSrc != qid ||
+                                     ((qid & 1) == 0 && b != propagated &&
+                                      (fifo != 0 || t.noUserHelp() != 0))) &&
+                                    U.getReferenceAcquire(a, np) != null) {
+                                    propagated = nb;
+                                    signalWork();
+                                }
+                                w.topLevelExec(t, fifo);
+                                rescan = true;
+                                b = q.base;
+                            }
+                        }
+                    }
+                }
+                if (!rescan && runState == e) {
+                    if (((phase = deactivate(w, phase)) & IDLE) != 0)
+                        break;
+                    src = -1;                            // re-enable propagation
                 }
             }
         }
     }
 
     /**
-     * Scans for and executes tasks.
+     * Deactivates and if necessary awaits signal or termination.
+     *
      * @param w the worker
-     * @param r random seed
-     * @param phase w's current known phase
-     * @param src queue index of last taken task, or -1 if none
-     * @return long packed with phase and src, with phase as 0 for exit,
-     * and src as SCAN_WAIT if empty and deactivated
+     * @param phase current phase
+     * @return current phase, with IDLE set if worker should exit
      */
-    private long scan(WorkQueue w, int r, int phase, int src) {
-        long e = runState;
-        WorkQueue[] qs = queues;
-        int i = r, stride = (r >>> 16) | 1, idle = phase & IDLE, taken = 0, n;
-        if ((e & STOP) != 0L || qs == null || w == null || (n = qs.length) <= 0)
-            phase = src = 0;
-        else {
-            int polls = (idle != 0 || src < 0 || (e & SHUTDOWN) != 0L) ? n :
-                n + (n | POLL_SPINS);
-            outer: for ( ; ; i += stride) {
-                WorkQueue q; int qid, cap; ForkJoinTask<?>[] a;
-                if ((q = qs[qid = i & (n - 1)]) != null &&
-                    (a = q.array) != null && (cap = a.length) > 0) {
-                    int m = cap - 1, b = q.base, prevb = b - 1, propagated = prevb;
-                    for ( ; ; prevb = b) {         // track stalls
-                        int nb; long bp;
-                        ForkJoinTask<?> t = (ForkJoinTask<?>)
-                            U.getReferenceAcquire(a, bp = slotOffset(m & b));
-                        long np = slotOffset(m & (nb = b + 1));
-                        if (b != (b = q.base)) {  // inconsistent / busy
-                            if (src != qid)
-                                break outer;      // reduce interference
-                        }
-                        else if (t == null ||     // possibly empty
-                                 (idle == 0 &&
-                                  !U.compareAndSetReference(a, bp, t, null))) {
-                            if (U.getReferenceAcquire(a, bp) == null) {
-                                if (U.getReference(a, np) == null &&
-                                    b == (b = q.base)) {
-                                    if (taken != 0)
-                                        break outer;
-                                    break;        // probably empty
-                                }
-                                if (b == prevb)   // stalled
-                                    break outer;  // reorder scan
-                            }
-                        }
-                        else if (idle == 0) {
-                            q.base = nb;
-                            if (U.getReferenceVolatile(a, np) != null &&
-                                b != propagated &&
-                                (src != qid || (qid & 1) == 0)) {
-                                propagated = nb;  // no signal if taken next
-                                signalWork();
-                            }
-                            if (src != qid)
-                                w.source = src = qid;
-                            w.topLevelExec(t);
-                            ++taken;
-                            b = q.base;
-                        }
-                        else if ((idle = (phase = w.phase) & IDLE) != 0) {
-                            WorkQueue v; int sp, j; long c; // try to reactivate
-                            if ((sp = (int)(c = ctl)) == 0 ||
-                                (j = sp & SMASK) >= n || (v = qs[j]) == null)
-                                break outer;      // stale
-                            long nc = (((c + RC_UNIT) & UMASK) |
-                                       (v.stackPred & LMASK));
-                            if (U.getReference(a, bp) == null ||
-                                !U.compareAndSetLong(this, CTL, c, nc))
-                                break outer;      // stale
+    private int deactivate(WorkQueue w, int phase) {
+        if (w == null)                        // currently impossible
+            return IDLE;
+        w.phase = phase | IDLE;
+        int activePhase = phase + (IDLE << 1);
+        long pc = ctl, qc, qac;
+        for (;;) {                           // enqueue
+            w.stackPred = (int)pc;
+            qac = (qc = (pc - RC_UNIT) & UMASK | (activePhase & LMASK)) & RC_MASK;
+            if (pc == (pc = U.compareAndExchangeLong(this, CTL, pc, qc)))
+                break;
+            else if (qac < (pc & RC_MASK))
+                return w.phase = phase;      // back out if lost to signal
+        }
+        long e; WorkQueue[] qs; int n;
+        if (((e = runState) & STOP) != 0L ||
+            ((e & SHUTDOWN) != 0L && qac == 0L && quiescent() > 0) ||
+            (qs = queues) == null || (n = qs.length) <= 0)
+            return IDLE;                     // terminating
+        int prechecks = Math.min((short)(qac >>> RC_SHIFT), 2);
+        for (int k = n + (n << 1), i = activePhase; k-- > 0 ; ++i) {
+            WorkQueue q; int cap; ForkJoinTask<?>[] a;
+            if ((q = qs[i & (n - 1)]) != null) {
+                if (w.phase == activePhase)
+                    return activePhase;
+                if ((a = q.array) != null && (cap = a.length) > 0 &&
+                    a[q.base & (cap - 1)] != null) {
+                    WorkQueue v; int sp, j; long c;
+                    if (prechecks > 0)
+                        --prechecks;
+                    else if (((c = ctl) & RC_MASK) <= qac && (sp = (int)c) != 0 &&
+                             (j = sp & SMASK) < n && (v = qs[j]) != null) {
+                        long nc = (v.stackPred & LMASK) | ((c + RC_UNIT) & UMASK);
+                        if (sp != activePhase && w.phase == activePhase)
+                            return activePhase;
+                        if ((sp == activePhase || k < n) &&
+                            U.compareAndSetLong(this, CTL, c, nc)) {
                             v.phase = sp;
-                            if (v != w) {
-                                if (v.parking == sp)
-                                    U.unpark(v.owner);
-                                break outer;      // v will signal w if needed
-                            }
-                            phase = sp;           // reactivated
-                            idle = 0;
+                            if (sp == activePhase)
+                                return activePhase;
+                            if (v.parking == sp)
+                                U.unpark(v.owner);
+                            break;
                         }
                     }
-                }
-                if ((--polls & (n - 1)) == 0) {
-                    if (runState != e || queues != qs)
-                        break;                    // stale
-                    if (polls <= 0) {
-                        if (idle != 0)
-                            phase = SCAN_WAIT;    // await signal
-                        else {                    // try to deactivate
-                            int ip = phase | IDLE, ap = phase + (IDLE << 1);
-                            long pc = ctl;
-                            long qc = ((pc - RC_UNIT) & UMASK) | (ap & LMASK);
-                            w.stackPred = (int)pc;
-                            w.phase = ip;         // enqueue
-                            if (U.compareAndSetLong(this, CTL, pc, qc))
-                                phase = ip;
-                            else {
-                                w.phase = phase;  // back out on contention
-                                src = -1;
-                            }
-                        }
-                        break;
-                    }
+                    if (k < n)
+                        k = n;               // ensure re-encounter
                 }
             }
         }
-        if (taken != 0) {
-            w.nsteals += taken;
-            if ((w.config & CLEAR_TLS) != 0 &&
-                (Thread.currentThread() instanceof ForkJoinWorkerThread f))
-                f.resetThreadLocals();            // (instanceof check always true)
-        }
-        return (((long)src) << 32) | (phase & LMASK);
+        return ((phase = w.phase) == activePhase) ? activePhase : awaitWork(w, phase);
     }
 
     /**
      * Awaits signal or termination.
      *
      * @param w the work queue
-     * @param src nonnegative if ran tasks since last activation
-     * @return current phase, or 0 if worker should exit
+     * @param phase current phase (known to be idle)
+     * @return current phase, with IDLE set if worker should exit
      */
-    private int awaitWork(WorkQueue w, int src) {
-        int phase = 0;
-        if ((runState & STOP) == 0L && w != null && ((phase = w.phase) & IDLE) != 0) {
+    private int awaitWork(WorkQueue w, int phase) {
+        if (w != null) {
+            int activePhase = phase + IDLE, parking = 0;
             long deadline = 0L;
-            int parking = 0, activePhase = phase + IDLE;
-            for (;;) {
-                long e, c;
-                int ac = ((short)((c = ctl) >>> RC_SHIFT) & SMASK), hd;
-                if (((e = runState) & STOP) != 0L ||
-                    ((e & SHUTDOWN) != 0L && ac == 0 && quiescent() > 0)) {
-                    phase = 0;
-                    break;                    // quiescent termination
-                }
-                long d = 0L;
-                boolean trimmable = false;    // true if at ctl head and quiescent
-                if ((hd = (int)c - activePhase) == 0 && ac == 0) {
-                    boolean trim = false;
-                    long now = System.currentTimeMillis();
-                    if (deadline == 0L) {
-                        d = deadline = now + keepAlive;
-                        if (w.source == INVALID_ID) {
-                            w.source = 0;
+            boolean trim = (w.source == INVALID_ID);
+            if ((w.config & CLEAR_TLS) != 0 &&
+                (Thread.currentThread() instanceof ForkJoinWorkerThread f))
+                f.resetThreadLocals();       // (instanceof check always true)
+            while ((phase = w.phase) != activePhase) {
+                boolean trimmable = false;   // true if at ctl head and quiescent
+                long d = 0L, c;
+                Thread.interrupted();        // clear status
+                if ((runState & STOP) != 0L)
+                    break;
+                if ((int)(c = ctl) == activePhase) {
+                    if ((c & RC_MASK) == 0L) {
+                        long now = System.currentTimeMillis();
+                        if (deadline == 0L)
+                            d = deadline = now + keepAlive;
+                        else if ((d = deadline) - now <= TIMEOUT_SLOP)
                             trim = true;
-                        }
+                        if (trim && tryTrim(w, c, activePhase))
+                            break;
+                        trim = false;
+                        trimmable = true;
                     }
-                    else if ((d = deadline) - now <= TIMEOUT_SLOP)
-                        trim = true;
-                    if (trim && tryTrim(w, c, activePhase)) {
-                        phase = 0;
-                        break;
+                    if (parking == 0) {     // spin at head for approx 1 scan cost
+                        int tc = ((short)(c >>> TC_SHIFT) | 1) & SMASK;
+                        int spins = tc + (tc << 1);
+                        while ((phase = w.phase) != activePhase && --spins != 0)
+                            Thread.onSpinWait();
+                        if (phase == activePhase)
+                            break;
                     }
-                    trimmable = true;
                 }
-                Thread.interrupted();         // clear status
-                if (parking == 0) {
-                    int spins = ac;
-                    if (hd == 0)              // spin at head
-                        spins += (src < 0) ? POLL_SPINS : LOCK_SPINS;
-                    while (((phase = w.phase) & IDLE) != 0 && --spins > 0)
-                        Thread.onSpinWait();
-                    if ((phase & IDLE) == 0)
-                        break;
+                if (parking == 0) {          // enable unpark
                     LockSupport.setCurrentBlocker(this);
-                    parking = w.parking = activePhase; // enable unpark
+                    w.parking = parking = activePhase;
+                    if ((phase = w.phase) == activePhase)
+                        break;
                 }
-                if (((phase = w.phase) & IDLE) == 0)
-                    break;
                 U.park(trimmable, d);
-                if (((phase = w.phase) & IDLE) == 0)
-                    break;
             }
             if (parking != 0)
                 LockSupport.setCurrentBlocker(null);
