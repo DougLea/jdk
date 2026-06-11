@@ -1989,7 +1989,7 @@ public class ForkJoinPool extends AbstractExecutorService
                     int qid, cap; WorkQueue q; ForkJoinTask<?>[] a;
                     if ((q = qs[qid = i & (n - 1)]) != null &&
                         (a = q.array) != null && (cap = a.length) > 0) {
-                        int m = cap - 1, b = q.base, prevb = b - 1, propagated = prevb;
+                        int m = cap - 1, b = q.base, prevb = b - 1;
                         for (; ; prevb = b) {         // track stalls
                             int nb; long bp;
                             ForkJoinTask<?> t = (ForkJoinTask<?>)
@@ -2010,12 +2010,10 @@ public class ForkJoinPool extends AbstractExecutorService
                                             break scan;
                                         break;        // probably empty
                                     }
-                                    if (b == prevb) {  // stalled
-                                        rescan = true;
-                                        break scan;  // reorder scan
+                                    if (b == prevb || src != qid) {
+                                        rescan = true; // stalled or busy
+                                        break scan;   // reorder scan
                                     }
-                                    if (b == propagated)
-                                        propagated = nb;
                                 }
                             }
                             else {
@@ -2026,12 +2024,9 @@ public class ForkJoinPool extends AbstractExecutorService
                                 w.source = src = qid;    // volatile
                                 if (more &&
                                     (prevSrc != qid ||
-                                     ((qid & 1) == 0 && b != propagated &&
-                                      (fifo != 0 || t.noUserHelp() != 0))) &&
-                                    U.getReferenceAcquire(a, np) != null) {
-                                    propagated = nb;
+                                     ((qid & 1) == 0 &&
+                                      (fifo != 0 || t.noUserHelp() != 0))))
                                     signalWork();
-                                }
                                 w.topLevelExec(t, fifo);
                                 rescan = true;
                                 b = q.base;
